@@ -1,0 +1,649 @@
+---
+title: "DATA 607 Data Project"
+author: "Douglas Barley"
+date: "`r Sys.Date()`"
+
+output: 
+  html_document:
+    code_folding: hide
+---
+
+```{r warning = FALSE, message = FALSE, echo=FALSE}
+# load the required libraries
+library(DBI)
+library(dplyr)
+library(ggplot2)
+library(gridExtra)
+library(httr)
+library(jsonlite)
+library(leaflet)
+library(odbc)
+library(raster)
+library(RODBC)
+library(sf)
+library(spData)
+library(tidyverse)
+library(tmap)
+options(scipen=999) # suppress scientific notation
+```
+
+## Kiva loans
+### __Part 1 - Introduction and the big questions__
+
+<a href="http://www.kiva.org">Kiva.org</a> is a crowdfunding organization that helps people around the world by providing loans for a variety of purposes ranging across areas such as education, health, women, the arts, technology and business startups. The loans are disbursed directly to the borrowers, and many of the loans are targeted specifically to help people living in poverty.
+
+Kiva's lenders fund projects in many, but not all, of the countries around the world. Most of the countries where loans are made, which includes the US, include areas where there is greater relative poverty, but not all countries receive Kiva loans. This leads to the primary research question for this project, which is:
+
+#### __Research question__
+__Are a country's total population and poverty proportion predictive of the volumes and amounts of Kiva's microloans disbursed in that country?__
+
+In this question the dependent, or response, variables are the frequency and amounts of loans Kiva made in a given country.
+
+The numerical independent variables are the total population and poverty proportion for each country, and a qualitative independent variable is the country's name where the loans were disbursed.
+
+...and the research question leads to a further question that we may want to try to answer:
+
+#### __Corollary question__
+__If a country's total population and poverty proportion are predictive of the volumes and amounts of Kiva's microloans for a given country, can we predict the volumes and amounts of loans that _might_ be made in countries where loans are _not_ currently being made based on a specific country's total population and poverty proportion?__
+
+### __Part 2 - Data sources and acquisition methods__
+#### __World Bank csv import of total population per country__
+
+In order to answer the research question we first need to know the population for each country in the world. Population data is collected by the World Bank and is made available under its CC-BY 4.0 license as open data, given proper attribution. It is available on the ___<a href="https://data.worldbank.org/indicator/SP.POP.TOTL?end=2017&start=2014">World Bank website</a>___, and for this project it was extracted by downloading a .csv file from the World Bank, and storing that .csv file on my GitHub repo.
+
+Each case in the World Bank population data represents the annual total population of a given country per year from 1960 to 2019. For this project we are only interested in the years 2014 through 2017, which aligns with the dates in the available data on Kiva's loans.
+
+The World Bank population data from 1960 to 2019 was read into RStudio from the .csv file in GitHub as shown below, and it was then transformed to only show populations for the years 2014 through 2017 inclusive.
+```{r message = FALSE}
+WBpopURL <- "https://raw.githubusercontent.com/douglasbarley/Fall2020_FinalProject/main/PopulationByCountry.csv"
+WBmetaURL <- "https://raw.githubusercontent.com/douglasbarley/Fall2020_FinalProject/main/Metadata_Country_API_SP.POP.TOTL_DS2_en_csv_v2_1495124.csv"
+
+WB_Pop <- read.csv(WBpopURL) %>%
+  subset(select = c(CountryName, CountryCode, X2014, X2015, X2016, X2017)) %>%
+    pivot_longer(`X2014`:`X2017`, names_to = "PopYear")
+
+names(WB_Pop)[4] <- "Population"
+
+WB_Pop$PopYear <- type.convert(gsub('^.', '', WB_Pop$PopYear)) # replace the first character "X" with a null string
+
+head(WB_Pop)
+```
+
+The World Bank also provided a metadata file about the countries that includes the world region and overall income group as determined by the World Bank.
+```{r message = FALSE}
+WBmetaURL <- "https://raw.githubusercontent.com/douglasbarley/Fall2020_FinalProject/main/Metadata_Country_API_SP.POP.TOTL_DS2_en_csv_v2_1495124.csv"
+
+WB_Meta <- read.csv(WBmetaURL)
+names(WB_Meta)[1] <- "CountryCode"
+names(WB_Meta)[5] <- "CountryName"
+
+WB_Meta <- subset(WB_Meta, WB_Meta$IncomeGroup != "", select = c(CountryCode, Region, IncomeGroup))
+  
+head(WB_Meta)
+```
+
+With both files imported we can combine the data into a single set.
+```{r}
+WB_data <- inner_join(WB_Pop,WB_Meta, by = c("CountryCode" = "CountryCode"), copy = FALSE, keep = FALSE)
+head(WB_data, 10)
+```
+
+
+#### __World Health Organization (WHO) API import of poverty rates per country__
+
+With the population of each country in the world in hand, we next need to know that poverty rates for each country. Poverty data is collected by the WHO as part of their Global Health Observatory site. The data is openly available ___<a href="https://www.who.int/data/gho/info/gho-odata-api">World Health Organization via their API</a>___, and for this project it was extracted by accessing the API on the WHO the website.
+
+Each case represents the proportion of the total population that lived ___below the international poverty line of US$1.90/day___ for a given year, for each of the years 2014 through 2017 inclusive.  There are 1137 observations in the given data set.
+
+Two files were required from the API, because one file only had a 3-digit country code, whereas we wanted the full country name for each country.
+```{r message = FALSE}
+# Link to OData API for the World Health Organization (WHO) indicators on poverty
+WHO_PovertyAPI <- GET("https://ghoapi.azureedge.net/api/SI_POV_DAY1", verbose())
+http_status(WHO_PovertyAPI)
+
+# Link to OData API for the World Health Organization (WHO) values for the Country dimension
+WHO_CountryAPI <- GET("https://ghoapi.azureedge.net/api/DIMENSION/COUNTRY/DimensionValues", verbose())
+http_status(WHO_CountryAPI)
+```
+
+With a Success code of 200 the OData file was successfully read into a dataframe, but it was still difficult to read/interpret in plain language due to the structure of the file. As such I extracted the contents from the poverty data URL call as raw text, and
+then inserted the poverty data text into an R dataframe.
+```{r message = FALSE}
+WHO_PovertyList <- content(WHO_PovertyAPI, "text", encoding='UTF-8')
+WHO_PovertyListText <- fromJSON(WHO_PovertyList, flatten = TRUE)
+WHO_PovertyList_df <- as.data.frame(WHO_PovertyListText)
+str(WHO_PovertyList_df)
+```
+
+I then repeated the process for the country dimension data
+```{r message = FALSE}
+WHO_CountryList <- content(WHO_CountryAPI, "text", encoding='UTF-8')
+WHO_CountryListText <- fromJSON(WHO_CountryList, flatten = TRUE)
+WHO_CountryList_df <- as.data.frame(WHO_CountryListText)
+str(WHO_CountryList_df)
+```
+
+The 24 variables in the poverty dataframe and the 7 variables in the country dataframe were not all necessary for the project. So I decided to look at only the core information needed from the data, which I considered to be the country code, year and numerical percent of the population living in poverty from the poverty data set.
+```{r}
+WHO_PovertyList_df2 <- subset(WHO_PovertyList_df, select = c(value.SpatialDim, value.TimeDim, value.NumericValue))
+names(WHO_PovertyList_df2) <- c("CountryCode","Year","PctPoverty")
+head(WHO_PovertyList_df2)
+```
+
+And I only needed the country code, country name and parent region from the country dimension set.
+```{r}
+# get 3 variables from the country dimensions dataset
+WHO_CountryList_df2 <- subset(WHO_CountryList_df, select = c(value.Code, value.Title, value.ParentTitle))
+names(WHO_CountryList_df2) <- c("CountryCode","CountryName","WorldRegion")
+head(WHO_CountryList_df2)
+```
+
+Once I extracted the data from the poverty and country data sets, I merged them into a single WHO_poverty data frame, retaining only observations in the years 2014 through 2017 in order to align with the Kiva loan data.
+```{r}
+WHO_poverty <- 
+  inner_join(WHO_PovertyList_df2,WHO_CountryList_df2, by = c("CountryCode" = "CountryCode"), copy = FALSE, keep = FALSE) %>%
+    filter(Year >= 2014 & Year < 2018)
+
+WHO_poverty <- WHO_poverty[c("CountryName","CountryCode","WorldRegion","Year","PctPoverty")]
+
+head(WHO_poverty,7)
+```
+
+
+#### __Kiva.org import from Azure database of loans made per country__
+
+Kiva loan data from 2014 through 2017 was available as part of a ___<a href="https://www.kaggle.com/kiva/data-science-for-good-kiva-crowdfunding">Kaggle challenge</a>___. The data was available under a public domain license from the Kaggle website, but the .csv download was 187 MB, which I found was too large to upload to GitHub.
+
+I created an Azure account and established an Azure database, to which I uploaded the .csv file, but when I tried to read the table with 671,205 observations spanning the period from 2014 through mid-2017 into RStudio I found it took a long time. So I created 4 views in the Azure database using SQL code. Each view was for each year of the data, and I was able to import each view from Azure into its own dataframe in RStudio. Then I used the `rbind` function to reassemble all of the data into a single dataframe inside RStudio.
+
+Each case in the data represents a loan made to an economically disadvantaged person in the currency of the recipient's residency. 
+
+I created a user account inside the Azure database named `Rconnection` which was used to establish the connection from this document to the Azure data source:
+```{r echo=TRUE, results='hide', warning=FALSE, message=FALSE}
+# connect to the server
+my_connection <- dbConnect(drv = odbc::odbc(),
+         Driver = "SQL Server",
+         server = "cuny.database.windows.net",
+         database = "CUNY",
+         uid = "Rconnection",
+         pwd = "RS606Proj#1")
+
+kiva_2014 <- dbGetQuery(my_connection,'
+  SELECT [id]
+        ,[funded_amount]
+        ,[loan_amount]
+        ,[activity]
+        ,[sector]
+        ,[country_code]
+        ,[country]
+        ,[currency]
+        ,[partner_id]
+        ,[posted_time]
+        ,[disbursed_time]
+        ,[funded_time]
+        ,[term_in_months]
+        ,[lender_count]
+        ,[repayment_interval]
+        ,[date]
+    FROM [dbo].[vw_kiva_loans_2014]
+')
+
+kiva_2015 <- dbGetQuery(my_connection,'
+  SELECT [id]
+        ,[funded_amount]
+        ,[loan_amount]
+        ,[activity]
+        ,[sector]
+        ,[country_code]
+        ,[country]
+        ,[currency]
+        ,[partner_id]
+        ,[posted_time]
+        ,[disbursed_time]
+        ,[funded_time]
+        ,[term_in_months]
+        ,[lender_count]
+        ,[repayment_interval]
+        ,[date]
+    FROM [dbo].[vw_kiva_loans_2015]
+')
+
+kiva_2016 <- dbGetQuery(my_connection,'
+  SELECT [id]
+        ,[funded_amount]
+        ,[loan_amount]
+        ,[activity]
+        ,[sector]
+        ,[country_code]
+        ,[country]
+        ,[currency]
+        ,[partner_id]
+        ,[posted_time]
+        ,[disbursed_time]
+        ,[funded_time]
+        ,[term_in_months]
+        ,[lender_count]
+        ,[repayment_interval]
+        ,[date]
+    FROM [dbo].[vw_kiva_loans_2016]
+')
+
+kiva_2017 <- dbGetQuery(my_connection,'
+  SELECT [id]
+        ,[funded_amount]
+        ,[loan_amount]
+        ,[activity]
+        ,[sector]
+        ,[country_code]
+        ,[country]
+        ,[currency]
+        ,[partner_id]
+        ,[posted_time]
+        ,[disbursed_time]
+        ,[funded_time]
+        ,[term_in_months]
+        ,[lender_count]
+        ,[repayment_interval]
+        ,[date]
+    FROM [dbo].[vw_kiva_loans_2017]
+')
+```
+
+Combine all years of data into a single dataframe and take a look at the structure of the data.
+```{r }
+kiva <- rbind(kiva_2014,kiva_2015,kiva_2016,kiva_2017)
+
+kiva <- mutate(kiva, Year = as.integer(substr(kiva$date,1,4)))
+
+str(kiva)
+```
+
+
+#### __Data integration for use in a multivariate logistic regression__
+
+With all three discrete datasets imported, I wanted to combine the information in a way that I could use it to run a multiple regression model. I started with combining all the WB_data with the WHO_poverty percent of the total population in poverty for each country using a `left_join()` function.
+```{r}
+world_poverty <- left_join(WB_data,WHO_poverty, by = c("CountryCode" = "CountryCode", "PopYear" = "Year"), copy = FALSE, keep = FALSE)
+names(world_poverty)[1] <- "CountryName"
+world_poverty <- world_poverty[c("CountryName", "CountryCode", "PopYear", "Population", "Region", "IncomeGroup", "PctPoverty")]
+head(world_poverty,10)
+```
+
+Then I wanted to aggregate the number and amounts of loans for each year in each country from the kiva dataframe...
+```{r message = FALSE}
+kiva_loans <- kiva %>%
+  group_by(country,Year,sector) %>%
+    summarise(loan_count = n(), loan_totals = sum(loan_amount)) %>%
+      mutate(avg_loan_amount = round(loan_totals / loan_count,2))
+
+head(kiva_loans)
+```
+...which compressed 671,205  observations of 17 variables down to 3,162 observations of 6 variables.
+
+Then I joined the Kiva loans set with the world_poverty table to arrive at the core data I wanted to analyze for the project.
+```{r}
+world_loans <- left_join(world_poverty,kiva_loans, by = c("CountryName" = "country", "PopYear" = "Year"), copy = FALSE, keep = FALSE)
+names(world_loans)[3] <- "Year"
+head(world_loans,10)
+```
+
+
+#### __Exploring the proposed model data set__
+
+Using the `world_loans` dataframe we can create a training set to include only the countries that have received loans and a test set that includes only the countries that have not received loans.
+
+Here is the training set that includes a sector, total loan count, total loan amount and average loan amount for each country that received loans:
+```{r message = FALSE}
+world_loan_tr <- world_loans %>%
+    group_by(CountryName, Region, IncomeGroup) %>%
+      summarise(avg_Pop = mean(Population), avg_pctPoverty = mean(PctPoverty, na.rm = TRUE)) %>%
+        replace_na(list(avg_pctPoverty = 0))
+
+world_loan_train <- left_join(world_loan_tr, kiva_loans, by = c("CountryName" = "country"), copy = FALSE, keep = FALSE) %>%
+    group_by(CountryName, Region, IncomeGroup,avg_Pop,avg_pctPoverty,sector) %>%
+      summarise(total_loan_count = sum(loan_count), total_loan_amount = sum(loan_totals)) %>%
+        mutate(avg_loan_amount = round(total_loan_amount / total_loan_count,2)) %>%
+          filter(total_loan_count > 0)
+
+world_loan_train
+```
+
+
+And here is the test set that includes no sector, loan count, total loan amount or average loan amount since there were no loans made to these countries:
+```{r message = FALSE}
+world_loan_test <- left_join(world_loan_tr, kiva_loans, by = c("CountryName" = "country"), copy = FALSE, keep = FALSE) %>%
+    group_by(CountryName, Region, IncomeGroup,avg_Pop,avg_pctPoverty,sector) %>%
+      summarise(total_loan_count = sum(loan_count), total_loan_amount = sum(loan_totals)) %>%
+        mutate(avg_loan_amount = round(total_loan_amount / total_loan_count,2)) %>%
+          filter(is.na(total_loan_count))
+
+world_loan_test
+```
+
+Having arrived at this point in the project, we can see what the data has provided for the analysis.
+```{r}
+train_countries <- n_distinct(world_loan_train$CountryName)
+test_countries <- n_distinct(world_loan_test$CountryName)
+
+cat("This gives us a training set with", train_countries,"countries and a test set with",test_countries,"countries.")
+```
+
+
+### __Part 3 - Exploratory data analysis__
+#### __Exploring loan recipients by country__
+
+With the data in hand the top of mind question is: where is Kiva making loans, and where are they ___not___ making loans?
+
+Quick map view of the countries in the training dataset (i.e countries with loans).
+```{r message = FALSE}
+data("World") # get world geography from tmap dataframe
+
+train_countries_names <- distinct(world_loan_train, CountryName)
+
+world_loan_train_map <- World %>%
+  filter(name %in% train_countries_names$CountryName)
+
+tmap_mode("view") # interactive map view
+
+tm_shape(world_loan_train_map) +
+  tm_polygons("income_grp") +
+  tm_tiles("Stamen.TonerLabels")
+```
+
+
+Quick map view of the countries in the test dataset (i.e. countries not receiving loans).
+```{r message = FALSE}
+data("World") # get world geography from tmap dataframe
+
+test_countries_names <- distinct(world_loan_test, CountryName)
+
+world_loan_test_map <- World %>%
+  filter(name %in% test_countries_names$CountryName)
+
+tmap_mode("view") # interactive map view
+
+tm_shape(world_loan_test_map) +
+  tm_polygons("income_grp") +
+  tm_tiles("Stamen.TonerLabels")
+```
+
+
+#### __Digging into the training data (i.e. the set with all the historical Kiva loans)__
+
+Let's quantify the number and amounts of loans, as well as the average loan by world region.
+```{r message = FALSE}
+
+loans_by_region <- world_loans %>%
+    group_by(Region) %>%
+      summarise(loan_count = sum(loan_count, na.rm = TRUE), loan_totals = sum(loan_totals, na.rm = TRUE)) %>%
+        mutate(avg_loan_amount = round(loan_totals / loan_count,2))
+
+loans_by_region[order(loans_by_region$avg_loan_amount, decreasing = TRUE),]
+```
+
+```{r message = FALSE}
+loans_by_region$Region <- factor(loans_by_region$Region, levels = loans_by_region$Region[order(loans_by_region$loan_count)])
+
+loans_by_region_count <- ggplot(data=loans_by_region, aes(x=Region,y=loan_count)) + 
+  geom_col(fill="lightblue") + 
+  geom_text(label=(c(loans_by_region$loan_count))) +
+  ggtitle("Number of loans by region") +
+  xlab('Region') +
+  ylab('Count of loans') +
+  coord_flip()
+
+loans_by_region$Region <- factor(loans_by_region$Region, levels = loans_by_region$Region[order(loans_by_region$loan_count)])
+
+loans_by_region_total_amount <- ggplot(data=loans_by_region, aes(x=Region,y=loan_totals)) + 
+  geom_col(fill="lightblue") + 
+  geom_text(label=(c(loans_by_region$loan_totals))) +
+  ggtitle("Total $ amount of loans by region") +
+  xlab('Region') +
+  ylab('Total $ amount of loans') +
+  coord_flip()
+
+loans_by_region$Region <- factor(loans_by_region$Region, levels = loans_by_region$Region[order(loans_by_region$loan_count)])
+
+loans_by_region_avg_amount <- ggplot(data=loans_by_region, aes(x=Region,y=avg_loan_amount)) + 
+  geom_col(fill="lightblue") + 
+  geom_text(label=(c(loans_by_region$avg_loan_amount))) +
+  ggtitle("Avg $ amount of loans by region") +
+  xlab('Region') +
+  ylab('Avg $ amount of loans') +
+  coord_flip()
+
+grid.arrange(loans_by_region_count, loans_by_region_total_amount, loans_by_region_avg_amount, nrow = 3)
+```
+
+It appears that the highest total dollars are going to Latin America & the Caribbean region with $183M in total loan dollars, but the greatest number of loans are going to East Asia & the Pacific. Interestingly East Asia & the Pacific region have the lowest average dollars in each loan with a mean of only \$475.56 per loan. Also noteworthy is that North America receives the fewest number of loans, but the average loan dollars is the highest in the world at a mean of \$5,169.27 per loan.
+
+We could also view the data as a scatterplot with regresssion lines.
+```{r}
+ggplot(world_loan_train, aes(x = avg_loan_amount, y = total_loan_count)) + geom_jitter(aes(color = Region)) + stat_smooth(method ="lm",se = TRUE) + scale_x_continuous(trans = 'log10') + scale_y_continuous(trans = 'log10') + coord_flip() + facet_wrap(~ Region)
+```
+
+This confirms the same trend in lending by region just with a different view of the data.
+
+Moving on, instead of grouping by geographic region, let's also look at the number and amounts of loans by country-level income groups regardless of geographic region.
+```{r message = FALSE}
+
+loans_by_affluence <- world_loans %>%
+    group_by(IncomeGroup) %>%
+      summarise(loan_count = sum(loan_count, na.rm = TRUE), loan_totals = sum(loan_totals, na.rm = TRUE)) %>%
+        mutate(avg_loan_amount = round(loan_totals / loan_count,2))
+
+loans_by_affluence[order(loans_by_affluence$avg_loan_amount, decreasing = TRUE),]
+```
+
+```{r message = FALSE}
+loans_by_affluence$IncomeGroup <- factor(loans_by_affluence$IncomeGroup, levels = loans_by_affluence$IncomeGroup[order(loans_by_affluence$loan_count)])
+
+loans_by_income_count <- ggplot(data=loans_by_affluence, aes(x=IncomeGroup,y=loan_count)) + 
+  geom_col(fill="lightblue") + 
+  geom_text(label=(c(loans_by_affluence$loan_count))) +
+  ggtitle("Number of loans by income group") +
+  xlab('Income group') +
+  ylab('Total $ amount of loans') +
+  coord_flip()
+
+loans_by_affluence$Region <- factor(loans_by_affluence$IncomeGroup, levels = loans_by_affluence$IncomeGroup[order(loans_by_affluence$loan_count)])
+
+loans_by_income_total_amount <- ggplot(data=loans_by_affluence, aes(x=IncomeGroup,y=loan_totals)) + 
+  geom_col(fill="lightblue") + 
+  geom_text(label=(c(loans_by_affluence$loan_totals))) +
+  ggtitle("Total $ amount of loans by income group") +
+  xlab('Income group') +
+  ylab('Total $ amount of loans') +
+  coord_flip()
+
+loans_by_affluence$Region <- factor(loans_by_affluence$IncomeGroup, levels = loans_by_affluence$IncomeGroup[order(loans_by_affluence$loan_count)])
+
+loans_by_income_avg_amount <- ggplot(data=loans_by_affluence, aes(x=IncomeGroup,y=avg_loan_amount)) + 
+  geom_col(fill="lightblue") + 
+  geom_text(label=(c(loans_by_affluence$avg_loan_amount))) +
+  ggtitle("Avg $ amount of loans by income group") +
+  xlab('Income group') +
+  ylab('Total $ amount of loans') +
+  coord_flip()
+
+grid.arrange(loans_by_income_count, loans_by_income_total_amount, loans_by_income_avg_amount, nrow = 3)
+```
+
+It is curious that the high income countries receive the least total dollars but the highest average dollars per loan, while the lower middle income countries receive the greatest number of loans yet the lowest average dollars per loan. That means the lower middle income countries receive almost 9 times less on average per loan than the high income countries.  Could this approach to making loans possibly lend credence to the saying "the rich get richer and the poor get poorer?
+
+Let's take yet another view and look at total loan amounts by total loan counts by sector.
+```{r}
+ggplot(world_loan_train, aes(x = total_loan_amount, y = total_loan_count)) + geom_jitter(aes(color = Region)) + stat_smooth(method ="lm",se = TRUE) + scale_x_continuous(trans = 'log10') + scale_y_continuous(trans = 'log10') + coord_flip() + facet_wrap(~ sector)
+```
+
+Scanning across the loan sectors, it appears that loans for agriculture, clothing, food, and retail tend to receive more dollars than the other sectors. 
+
+
+We can use violin plots to get a sense of the overall distribution of loans by sector. 
+```{r}
+ggplot(world_loan_train, aes(y = total_loan_count, x = avg_loan_amount, color = sector)) + geom_violin() + scale_x_continuous(trans = 'log10') + scale_y_continuous(trans = 'log10') + coord_flip() + facet_wrap(~ sector)
+```
+
+Again agriculture, clothing, food and retail appear to have bigger bulges toward the top end of their loan counts in terms of avg amounts.
+
+
+### __Part 4 - Inference__
+
+#### __Simple Linear Regression__
+
+First let's look a little more at the training data in terms of predicting number of loans purely based on avg percent of poverty in a country.
+
+We see that the avg loans are quite right skewed, suggesting that the majority of loans made average smaller amounts.
+```{r message=FALSE}
+hist(world_loan_train$avg_loan_amount, breaks = 50, xlab = "Avg Loan", col = "lightblue", main = "Avg Loans")
+```
+
+If we fit a linear model called `m_loans` to predict the amount of loans made in a country by its average poverty percentage, we see that the equation for the linear model turns out to be \[\widehat{total\_loans} = 695.732 + 3.477 * avg\_Pct\_Poverty\]. 
+``` {r message = FALSE}
+m_loans_poverty <- lm(world_loan_train$total_loan_count ~ world_loan_train$avg_pctPoverty, data = world_loan_train)
+summary(m_loans_poverty)
+```
+
+We also see that there is a linear relationship between the avg Pct of poverty and the total loans received.
+``` {r message = FALSE, warning = FALSE}
+ggplot(world_loan_train, aes(x = avg_pctPoverty, y = total_loan_count)) + geom_jitter(aes(color = Region)) + stat_smooth(method ="lm",se = TRUE) + scale_x_continuous(trans = 'log10') + scale_y_continuous(trans = 'log10')
+```
+
+
+Let's pause to verify that the conditions for this model are reasonable using the standard diagnostic plots.
+``` {r message = FALSE, warning = FALSE}
+ggplot(data = m_loans_poverty, aes(x = .fitted, y = .resid)) +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  xlab("Fitted values") +
+  ylab("Residuals") + stat_smooth(method ="lm",se = TRUE) + scale_x_continuous(trans = 'log10') + scale_y_continuous(trans = 'log10')
+```
+
+The variability of points around the least squares line remains roughly constant with a few extreme outliers, meaning that the relationship between the avg pct of poverty and the total amount of loans is roughly linear.
+
+```{r message = FALSE}
+ggplot(data = m_loans_poverty, aes(x = .resid)) +
+  geom_histogram() +
+  xlab("Residuals") 
+```
+
+The residuals show a considerable right skew with several far outliers.
+
+```{r}
+ggplot(data = m_loans_poverty, aes(sample = .resid)) +
+  stat_qq() 
+```
+
+The qq-plot also shows a highly right skewed curve with several high end outliers.
+
+
+#### __Running logistic regressions to find a predictor model__
+
+We will run the full model first against the training set. So let's create the full model.
+```{r message = FALSE}
+m_loans <- lm(total_loan_count ~ CountryName + Region + IncomeGroup + sector + avg_Pop + avg_pctPoverty, data = world_loan_train)
+summary(m_loans)
+```
+
+Let's check the conditions for the regression.
+```{r message = FALSE}
+ggplot(data = m_loans, aes(x = .resid)) +
+  geom_histogram() +
+  xlab("Residuals")
+```
+
+The model is somewhat normal but with several extreme outliers.
+
+``` {r message = FALSE, warning = FALSE}
+ggplot(data = m_loans, aes(x = .fitted, y = .resid)) +
+  geom_jitter() +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  xlab("Fitted values") +
+  ylab("Residuals") + stat_smooth(method ="lm",se = TRUE) + scale_x_continuous(trans = 'log10') + scale_y_continuous(trans = 'log10')
+```
+
+The variance of the residuals is not constant with several outliers.
+
+```{r}
+ggplot(data = m_loans, aes(sample = .resid)) +
+  stat_qq() 
+```
+
+The qqplot also appears quite right skewed with outliers on both tails.
+
+So the conditions for mutliple or logistic regression are not met.
+
+In the full model CountryName is a unique value to each country and cannot be "predicted" as a value for another country. Moreover, it appears that by including the specific countries that are already receiving loans we are overfitting the model, so we will remove the country names and see what happens.
+```{r message = FALSE}
+m_loans <- lm(total_loan_count ~ Region + IncomeGroup + sector + avg_Pop + avg_pctPoverty, data = world_loan_train)
+summary(m_loans)
+```
+
+
+The relative strength of the model without country names dropped to \[R^2_{adj} = 0.07324\].
+
+It is interesting that with the country names included the dimensions of world region and income group were all "NA", but without the countries they begin to assume some significance within certain values such as Region = Europe & Central Asia and Income Group = Lower middle income.
+
+For the next round we will remove Region since it has the highest p-value in North America.
+```{r message = FALSE}
+m_loans <- lm(total_loan_count ~ IncomeGroup + sector + avg_Pop + avg_pctPoverty, data = world_loan_train)
+summary(m_loans)
+```
+
+The relative strength of the model without Region dropped to \[R^2_{adj} = 0.06449\].
+
+The adjusted-R-squared decreased by removing region so we will add it back in, and now the largest p-value is in avg_Pop, so we will try removing that dimension next.
+```{r message = FALSE}
+m_loans <- lm(total_loan_count ~ Region + IncomeGroup + sector + avg_pctPoverty, data = world_loan_train)
+summary(m_loans)
+```
+
+The relative strength of the model without avg_Pop increased to \[R^2_{adj} = 0.07399\]. It appears that avg_Pop is not a predictor variable for this model.
+
+The adjusted-R-squared increased slightly by removing the avg_Pop, and next we can try removing the avg_pctPoverty since it has the next highest p-value.
+```{r message = FALSE}
+m_loans <- lm(total_loan_count ~ Region + IncomeGroup + sector, data = world_loan_train)
+summary(m_loans)
+```
+
+The relative strength of the model without Avg_PctPoverty decreased to \[R^2_{adj} = 0.07373\].
+
+Removing Avg_PctPoverty decreased the strength of the model, so it should be added back again.  Last we can remove sector and see what that does to the overall model.
+```{r message = FALSE}
+m_loans <- lm(total_loan_count ~ IncomeGroup + avg_Pop + avg_pctPoverty, data = world_loan_train)
+summary(m_loans)
+```
+
+The relative strength of the model without sector decreased to \[R^2_{adj} = 0.01495\]. It seems that sector adds great value to the model.
+
+Since removing sector is catastrophic to the model, and since the test set has no sector values in it to predict upon, this seems to be a failing venture. So we will have to abandon the prospect at this time of creating a predictive model based on the training and testing data that was derived from the current available datasets.
+
+### __Part 5 - Conclusion__
+
+Examing the lending practices of essentially Americans to the rest of the world in which we live is an important thing to examine, because it shows our preferences for helping and supporting different parts of the world.  It may even possibly hint at underlying attitudes about the regions of the world we are being so philanthropic towards.
+
+The above analysis roughly succeeded in the simple linear regression of using poverty levels to predict a rough number of loans made, as we see in this faceted version of a prior graphic above:
+``` {r message = FALSE, warning = FALSE}
+ggplot(world_loan_train, aes(x = avg_pctPoverty, y = total_loan_count)) + geom_jitter(aes(color = Region)) + facet_wrap(~ Region) + stat_smooth(method ="lm",se = TRUE) + scale_x_continuous(trans = 'log10') + scale_y_continuous(trans = 'log10')
+```
+
+There is a positive linear relationship in several regions of the world between the poverty in the area and the number of loans received from Kiva.
+
+However, we utterly failed to create an ideal multivariate model by which to predict how many loans might be made to each country that did not receive loans based on characteristics of the given country.
+
+It may be possible that there are other factors underlying the lending tendencies of Americans toward the rest of the world, which could be confounding to the current analysis if those factors are not present in it.  Perhaps if we were to include other characteristics of the countries that received loans, such as predominant race, ethnicity, political stance and religious prevalence in each country, we might be better equipped to distill a better model to predict where Americans overall might be willing to invest their money to lift up those who need help.
+
+### __References__
+
+Kiva, November 3, 2020, https://www.kiva.org/.
+
+"Population, total." The World Bank, November 3, 2020. https://data.worldbank.org/indicator/SP.POP.TOTL?end=2017&start=2014.
+
+"GHO OData API." The World Health Data Platform, November 3, 2020. https://www.who.int/data/gho/info/gho-odata-api.
+
+“Data Science for Good: Kiva Crowdfunding.” Kaggle, November 3. 2020, https://www.kaggle.com/kiva/data-science-for-good-kiva-crowdfunding.
+
+"tmap: get started!" November 20, 2020, https://cran.r-project.org/web/packages/tmap/vignettes/tmap-getstarted.html.
+
+
+
